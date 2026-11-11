@@ -72,5 +72,7 @@ probeRules = do
     E.collectionProblems contract (collection [0, 2]) /== []
     let hugging = E.Collection [] [E.ProbePlan N.Candidate [0, 1]] (Map.fromList [(N.Reference, scorer {E.scorerBackend = "hf"}), (N.Candidate, scorer {E.scorerBackend = "hf"})])
     assert (any ((== "The Hugging Face scorer records no full-vocabulary probe") . E.collectionMessage) (E.collectionProblems contract hugging))
+    let identical = base {U.criterion = (U.criterion base) {U.numericalRequirements = [requirement [0, 1], requirement [0, 1]]}}
+    E.collectionProblems identical (collection [0, 1]) === []
     let conflicting = base {U.criterion = (U.criterion base) {U.numericalRequirements = [requirement [0], requirement [1]]}}
     E.collectionProblems conflicting (collection [0]) /== []

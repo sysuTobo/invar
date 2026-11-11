@@ -210,6 +210,13 @@ logPath group = "logs" </> (label group ++ ".jsonl")
 callsPath :: Group -> FilePath
 callsPath group = "logs" </> (label group ++ "-calls.json")
 
+data MemoryReading = MemoryReading
+    { memoryMetric :: String
+    , memoryScope :: String
+    , memoryBytes :: Integer
+    }
+    deriving (Eq, Show)
+
 data Collected = Collected
     { collectedKind :: String
     , collectedInput :: U.Input
@@ -223,7 +230,7 @@ data Collected = Collected
     , collectedTargetPolicy :: Policy.Description
     , collectedLogDigest :: String
     , collectedSeconds :: Double
-    , collectedPeakMemory :: Maybe Integer
+    , collectedMemory :: Maybe MemoryReading
     }
 
 execute :: FilePath -> FilePath -> Execution.Execution -> [Group] -> IO ([Value], Map.Map (U.Key, N.Side) Inference.Report)
@@ -391,7 +398,7 @@ collect output contract plan reports records = loop [] records specs
                                                         , collectedTargetPolicy = targetPolicy
                                                         , collectedLogDigest = fromMaybe "" logDigest
                                                         , collectedSeconds = seconds
-                                                        , collectedPeakMemory = peakMemory report
+                                                        , collectedMemory = memoryReading report
                                                         }
                                              in pure (Right collected, logRecord)
     collectionLog spec = "logs/collection-" ++ show (specCall spec) ++ ".jsonl"
@@ -429,38 +436,44 @@ policyValue described =
         , "assembly" .= Policy.assembly described
         ]
 
-peakMemory :: Score.Report -> Maybe Integer
-peakMemory report = case Score.describe report of
+memoryReading :: Score.Report -> Maybe MemoryReading
+memoryReading report = case Score.describe report of
     Object top -> case Fields.lookup "observation" top of
         Just (Object observation) -> case Fields.lookup "measurements" observation of
-            Just (Array measurements) -> maximumMaybe (mapMaybe measured (toList measurements))
+            Just (Array measurements) -> best (mapMaybe measured (toList measurements))
             _ -> Nothing
         _ -> Nothing
     _ -> Nothing
   where
     measured (Object fields) = case Fields.lookup "peak_active" fields >>= number of
-        Just value -> Just value
+        Just value -> Just (MemoryReading "peak_active" "mlx device allocator" value)
         Nothing -> case Fields.lookup "workers" fields of
-            Just (Array workers) -> maximumMaybe (mapMaybe worker (toList workers))
+            Just (Array workers) -> best (mapMaybe worker (toList workers))
             _ -> Nothing
     measured _ = Nothing
-    worker (Object fields) = max <$> numberField "peak_allocated" fields <*> numberField "peak_reserved" fields
+    worker (Object fields) = case numberField "peak_reserved" fields of
+        Just value -> Just (MemoryReading "peak_reserved" "torch.cuda worker device allocator" value)
+        Nothing -> Nothing
     worker _ = Nothing
     numberField name fields = Fields.lookup name fields >>= number
     number value = case (fromJSON value :: Result Integer) of
         Success found -> Just found
         _ -> Nothing
-    maximumMaybe [] = Nothing
-    maximumMaybe values = Just (maximum values)
+    best [] = Nothing
+    best (initial : rest) = Just (foldl larger initial rest)
+    larger left right = if memoryBytes left >= memoryBytes right then left else right
 
 costOf :: Double -> FilePath -> [Group] -> [Collected] -> IO Value
 costOf wall output planned collected = do
     records <- Bytes.readFile (output </> "records.json")
     logs <- listDirectory (output </> "logs")
     logBytes <- sum <$> traverse (\name -> getFileSize (output </> "logs" </> name)) logs
-    let peaks = mapMaybe collectedPeakMemory collected
-        peak = case peaks of [] -> Null; values -> toJSON (maximum values)
-        memoryStatus = if null peaks then ("unmeasured" :: String) else "score-probe-peak"
+    let memories = mapMaybe collectedMemory collected
+        best = case memories of [] -> Nothing; initial : rest -> Just (foldl larger initial rest)
+        peak = maybe Null (toJSON . memoryBytes) best
+        metric = maybe Null (String . Text.pack . memoryMetric) best
+        scope = maybe Null (String . Text.pack . memoryScope) best
+        memoryStatus = if null memories then ("unmeasured" :: String) else "score-probe-device-allocator"
     pure
         ( object
             [ "inference_calls" .= sum [length (members group) | group <- planned]
@@ -469,12 +482,16 @@ costOf wall output planned collected = do
             , "wall_seconds" .= wall
             , "records_bytes" .= Bytes.length records
             , "logs_bytes" .= logBytes
-            , "peak_rss_bytes" .= peak
+            , "peak_device_allocator_bytes" .= peak
+            , "memory_metric" .= metric
+            , "memory_scope" .= scope
             , "memory_status" .= memoryStatus
+            , "memory_measurements" .= [object ["metric" .= memoryMetric value, "scope" .= memoryScope value, "bytes" .= memoryBytes value] | value <- memories]
             , "calls" .= [object ["kind" .= collectedKind value, "call" .= callOf (collectedBinding value), "seconds" .= collectedSeconds value] | value <- collected]
             ]
         )
   where
+    larger left right = if memoryBytes left >= memoryBytes right then left else right
     callOf (V.Binding (V.CallId call) _ _) = call
 
 describeCollection :: U.UseContract -> Execution.Execution -> [Group] -> Value
@@ -550,13 +567,13 @@ rows contract plan planned collected =
         values -> [("probe-set", Text.unpack (TextBytes.decodeUtf8 (Lazy.toStrict (encode (probeValue values)))))]
     probeValue values =
         [ object ["path" .= pathName path, "steps" .= collectedSteps value, "reference" .= endpoint N.Reference, "candidate" .= endpoint N.Candidate]
-        | let endpoint target = maybe Null endpointValue (findTarget target values)
-        , (path, value) <- Map.toList (Map.fromList [(collectedPath value, value) | value <- values])
+        | (path, value) <- Map.toList (Map.fromList [(collectedPath value, value) | value <- values])
+        , let endpoint target = maybe Null endpointValue (findTarget path target values)
         ]
     endpointValue value =
         let V.Binding (V.CallId call) (V.AttemptId attempt) (V.Instance instance') = collectedBinding value
          in object ["log" .= collectedLog value, "exit-code" .= show (collectedExit value), "call" .= call, "attempt" .= attempt, "instance" .= instance']
-    findTarget target values = case [value | value <- values, collectedTarget value == target] of
+    findTarget path target values = case [value | value <- values, collectedPath value == path, collectedTarget value == target] of
         [value] -> Just value
         _ -> Nothing
 

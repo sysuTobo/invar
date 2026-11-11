@@ -23,6 +23,7 @@ live :: ByteString -> IO ()
 live line = Bytes.hPut stdout (Bytes.snoc line '\n') >> hFlush stdout
 
 file :: Handle -> Transcript
-file handle = Transcript write write (const (pure ()))
+file handle = Transcript complete fragment (const (pure ()))
   where
-    write line = Bytes.hPut handle (Bytes.snoc line '\n') >> hFlush handle
+    complete line = Bytes.hPut handle (Bytes.snoc line '\n') >> hFlush handle
+    fragment line = Bytes.hPut handle line >> hFlush handle

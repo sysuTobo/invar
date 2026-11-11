@@ -65,7 +65,7 @@ collectionProblems contract collection = scoreProblems ++ probeProblems ++ score
             ++ [CollectionProblem "execution:collection.probes" ("The contract does not require a probe of the " ++ sideName side ++ " path") | side <- map probePath (probes collection), side `notElem` map fst requiredProbes]
             ++ [CollectionProblem ("execution:collection.probes[" ++ show index ++ "]") ("Probe steps for the " ++ sideName (probePath plan) ++ " path must " ++ expectation steps (probeSteps plan)) | (index, (plan, steps)) <- zip [0 :: Int ..] [(plan, steps) | plan <- probes collection, Just steps <- [lookup (probePath plan) requiredProbes]], probeSteps plan /= steps]
             ++ [CollectionProblem "execution:collection.probes" ("The contract requires a probe of the " ++ sideName side ++ " path") | (side, _) <- requiredProbes, side `notElem` map probePath (probes collection)]
-            ++ [CollectionProblem "execution:collection.probes" ("The contract names conflicting probe steps for the " ++ sideName side ++ " path") | side <- nub (map fst requiredProbes), length [steps | (selected, steps) <- requiredProbes, selected == side] > 1]
+            ++ [CollectionProblem "execution:collection.probes" ("The contract names conflicting probe steps for the " ++ sideName side ++ " path") | side <- nub (map fst requiredProbes), length (nub [steps | (selected, steps) <- requiredProbes, selected == side]) > 1]
     scorerProblems =
         [ CollectionProblem ("execution:collection.scorers." ++ sideName side) ("The plan has no scorer for the " ++ sideName side ++ " implementation")
         | side <- nub (scoreTargets ++ probeTargets)

@@ -27,13 +27,15 @@ import Invar.Numerical qualified as Numerical
 import Invar.Policy qualified as Policy
 import Invar.Score qualified as Score
 import Invar.Spec.Invocation qualified as V
+import Invar.Transcript qualified as Transcript
 import Store (workspace)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
+import System.IO (IOMode (..), withBinaryFile)
 import Workloads (everywhere, replace)
 
 inferenceObservations :: Group
-inferenceObservations = Group "Complete inference observations" [("complete observations retain bound results and exact source identity", once matching), ("repeated missing reordered and trailing records fail", once complete), ("loads programs bindings and model images must correspond", once correspondence), ("strict result field and raw JSON schemas apply", once malformed), ("behavior zero signs retain actual floating literals", once signedZero), ("integral spellings of counts seeds and bindings are admitted as integers", once integral), ("a log is replayed under the policy it was declared with, and another model is refused", once described), ("batch members retain the complete source through numerical and score inputs", once batchMatching), ("complete batch sources require loading and one complete framed execution", once batchBoundaries), ("a batch is admitted only under its whole declaration: absent, reused, repeated, reordered and mismatched members are refused", once batchPeers)]
+inferenceObservations = Group "Complete inference observations" [("complete observations retain bound results and exact source identity", once matching), ("repeated missing reordered and trailing records fail", once complete), ("loads programs bindings and model images must correspond", once correspondence), ("strict result field and raw JSON schemas apply", once malformed), ("behavior zero signs retain actual floating literals", once signedZero), ("integral spellings of counts seeds and bindings are admitted as integers", once integral), ("a log is replayed under the policy it was declared with, and another model is refused", once described), ("batch members retain the complete source through numerical and score inputs", once batchMatching), ("complete batch sources require loading and one complete framed execution", once batchBoundaries), ("a batch is admitted only under its whole declaration: absent, reused, repeated, reordered and mismatched members are refused", once batchPeers), ("a file transcript preserves complete lines and the bytes after the last newline", once transcriptFile)]
   where
     once = withTests 1 . property
 
@@ -259,3 +261,19 @@ reject :: ByteString -> PropertyT IO ()
 reject encoded = case observe encoded of
     Left _ -> success
     Right report -> annotateShow (Observation.describe report) >> failure
+
+transcriptFile :: PropertyT IO ()
+transcriptFile = do
+    root <- workspace
+    let path = root </> "transcript"
+    evalIO
+        ( withBinaryFile
+            path
+            WriteMode
+            ( \handle -> do
+                let selected = Transcript.file handle
+                Transcript.record selected "complete"
+                Transcript.partial selected "fragment"
+            )
+        )
+    evalIO (Bytes.readFile path) >>= (=== "complete\nfragment")
