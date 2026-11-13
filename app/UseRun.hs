@@ -14,7 +14,7 @@ import Data.ByteString.Lazy qualified as Lazy
 import Data.Foldable (toList)
 import Data.List (genericLength, mapAccumL)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe, mapMaybe)
+import Data.Maybe (fromMaybe)
 import Data.Text qualified as Text
 import Data.Text.Encoding qualified as TextBytes
 import Envelope (Problem (..), command, refuse, succeed)
@@ -213,6 +213,10 @@ callsPath group = "logs" </> (label group ++ "-calls.json")
 data MemoryReading = MemoryReading
     { memoryMetric :: String
     , memoryScope :: String
+    , memoryStage :: Maybe String
+    , memoryHost :: Maybe String
+    , memoryPid :: Maybe Integer
+    , memoryDevice :: Maybe String
     , memoryBytes :: Integer
     }
     deriving (Eq, Show)
@@ -230,7 +234,7 @@ data Collected = Collected
     , collectedTargetPolicy :: Policy.Description
     , collectedLogDigest :: String
     , collectedSeconds :: Double
-    , collectedMemory :: Maybe MemoryReading
+    , collectedMemory :: [MemoryReading]
     }
 
 execute :: FilePath -> FilePath -> Execution.Execution -> [Group] -> IO ([Value], Map.Map (U.Key, N.Side) Inference.Report)
@@ -398,7 +402,7 @@ collect output contract plan reports records = loop [] records specs
                                                         , collectedTargetPolicy = targetPolicy
                                                         , collectedLogDigest = fromMaybe "" logDigest
                                                         , collectedSeconds = seconds
-                                                        , collectedMemory = memoryReading report
+                                                        , collectedMemory = memoryReadings report
                                                         }
                                              in pure (Right collected, logRecord)
     collectionLog spec = "logs/collection-" ++ show (specCall spec) ++ ".jsonl"
@@ -436,44 +440,53 @@ policyValue described =
         , "assembly" .= Policy.assembly described
         ]
 
-memoryReading :: Score.Report -> Maybe MemoryReading
-memoryReading report = case Score.describe report of
+memoryReadings :: Score.Report -> [MemoryReading]
+memoryReadings report = case Score.describe report of
     Object top -> case Fields.lookup "observation" top of
         Just (Object observation) -> case Fields.lookup "measurements" observation of
-            Just (Array measurements) -> best (mapMaybe measured (toList measurements))
-            _ -> Nothing
-        _ -> Nothing
-    _ -> Nothing
+            Just (Array measurements) -> concatMap measured measurements
+            _ -> []
+        _ -> []
+    _ -> []
   where
-    measured (Object fields) = case Fields.lookup "peak_active" fields >>= number of
-        Just value -> Just (MemoryReading "peak_active" "mlx device allocator" value)
-        Nothing -> case Fields.lookup "workers" fields of
-            Just (Array workers) -> best (mapMaybe worker (toList workers))
-            _ -> Nothing
-    measured _ = Nothing
-    worker (Object fields) = case numberField "peak_reserved" fields of
-        Just value -> Just (MemoryReading "peak_reserved" "torch.cuda worker device allocator" value)
-        Nothing -> Nothing
-    worker _ = Nothing
+    measured (Object fields) =
+        let stage = stringField "stage" fields
+         in case Fields.lookup "peak_active" fields >>= number of
+                Just value -> [MemoryReading "peak_active" "mlx device allocator" stage Nothing Nothing (Just "mlx") value]
+                Nothing -> case Fields.lookup "workers" fields of
+                    Just (Array workers) -> concatMap worker workers
+                    _ -> []
+    measured _ = []
+    worker (Object fields) =
+        let stage = stringField "stage" fields
+            scope = fromMaybe "torch.cuda worker device allocator" (stringField "scope" fields)
+            host = stringField "host" fields
+            pid = Fields.lookup "pid" fields >>= number
+            device = stringField "device" fields
+         in case numberField "peak_reserved" fields of
+                Just value -> [MemoryReading "peak_reserved" scope stage host pid device value]
+                Nothing -> []
+    worker _ = []
+    stringField name fields = case Fields.lookup name fields of
+        Just (String text) -> Just (Text.unpack text)
+        _ -> Nothing
     numberField name fields = Fields.lookup name fields >>= number
     number value = case (fromJSON value :: Result Integer) of
         Success found -> Just found
         _ -> Nothing
-    best [] = Nothing
-    best (initial : rest) = Just (foldl larger initial rest)
-    larger left right = if memoryBytes left >= memoryBytes right then left else right
 
 costOf :: Double -> FilePath -> [Group] -> [Collected] -> IO Value
 costOf wall output planned collected = do
     records <- Bytes.readFile (output </> "records.json")
     logs <- listDirectory (output </> "logs")
     logBytes <- sum <$> traverse (\name -> getFileSize (output </> "logs" </> name)) logs
-    let memories = mapMaybe collectedMemory collected
+    let memories = [(value, reading) | value <- collected, reading <- collectedMemory value]
         best = case memories of [] -> Nothing; initial : rest -> Just (foldl larger initial rest)
-        peak = maybe Null (toJSON . memoryBytes) best
-        metric = maybe Null (String . Text.pack . memoryMetric) best
-        scope = maybe Null (String . Text.pack . memoryScope) best
-        memoryStatus = if null memories then ("unmeasured" :: String) else "score-probe-device-allocator"
+        peak = maybe Null (toJSON . memoryBytes . snd) best
+        metric = maybe Null (String . Text.pack . memoryMetric . snd) best
+        scope = maybe Null (String . Text.pack . memoryScope . snd) best
+        stage = maybe Null (maybe Null (String . Text.pack) . memoryStage . snd) best
+        memoryStatus = if null memories then ("unmeasured" :: String) else "probe-interval-max"
     pure
         ( object
             [ "inference_calls" .= sum [length (members group) | group <- planned]
@@ -482,16 +495,31 @@ costOf wall output planned collected = do
             , "wall_seconds" .= wall
             , "records_bytes" .= Bytes.length records
             , "logs_bytes" .= logBytes
-            , "peak_device_allocator_bytes" .= peak
+            , "peak_probe_device_allocator_bytes" .= peak
             , "memory_metric" .= metric
             , "memory_scope" .= scope
+            , "memory_stage" .= stage
             , "memory_status" .= memoryStatus
-            , "memory_measurements" .= [object ["metric" .= memoryMetric value, "scope" .= memoryScope value, "bytes" .= memoryBytes value] | value <- memories]
+            , "memory_measurements"
+                .= [ object
+                        [ "call" .= callOf (collectedBinding value)
+                        , "path" .= pathName (collectedPath value)
+                        , "target" .= pathName (collectedTarget value)
+                        , "metric" .= memoryMetric reading
+                        , "scope" .= memoryScope reading
+                        , "stage" .= memoryStage reading
+                        , "host" .= memoryHost reading
+                        , "pid" .= memoryPid reading
+                        , "device" .= memoryDevice reading
+                        , "bytes" .= memoryBytes reading
+                        ]
+                   | (value, reading) <- memories
+                   ]
             , "calls" .= [object ["kind" .= collectedKind value, "call" .= callOf (collectedBinding value), "seconds" .= collectedSeconds value] | value <- collected]
             ]
         )
   where
-    larger left right = if memoryBytes left >= memoryBytes right then left else right
+    larger left right = if memoryBytes (snd left) >= memoryBytes (snd right) then left else right
     callOf (V.Binding (V.CallId call) _ _) = call
 
 describeCollection :: U.UseContract -> Execution.Execution -> [Group] -> Value

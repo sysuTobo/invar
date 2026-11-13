@@ -8,6 +8,7 @@ import Data.Aeson.Types (Parser)
 import Data.ByteString qualified as Bytes
 import Data.ByteString.Char8 qualified as TextBytes
 import Data.ByteString.Lazy.Char8 qualified as Lazy
+import Data.List (nub)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (isJust, isNothing)
@@ -193,12 +194,20 @@ probeInputs fields (left, right)
             )
 
 probeSide :: O.Fields -> Either String N.Side
-probeSide fields = do
-    selected <- O.required fields "probe-path"
-    case selected of
-        "reference" -> Right N.Reference
-        "candidate" -> Right N.Candidate
-        _ -> Left "Probe path must be reference or candidate"
+probeSide fields = case O.optional fields "probe-path" of
+    Just selected -> parseSide selected
+    Nothing -> case O.optional fields "probe-set" of
+        Just encoded -> do
+            sets <- eitherDecodeStrict (TextBytes.pack encoded) :: Either String [ProbeSet]
+            case nub (map setPath sets) of
+                [selected] -> Right selected
+                [] -> Left "A probe set names no path"
+                _ -> Left "A probe set with several paths needs --probe-path"
+        Nothing -> Left "KL requires --probe-path or a probe set with one path"
+  where
+    parseSide "reference" = Right N.Reference
+    parseSide "candidate" = Right N.Candidate
+    parseSide _ = Left "Probe path must be reference or candidate"
 
 selectedRelation :: O.Fields -> Either String N.Relation
 selectedRelation fields = do
@@ -240,7 +249,7 @@ pairOptions =
         ++ concatMap scored ["reference-score-", "candidate-score-"]
         ++ concatMap probed ["reference-probe-", "candidate-probe-"]
         ++ O.descriptions
-            [ ("probe-path", "reference | candidate: source path for both full-vocabulary probes and the KL claim")
+            [ ("probe-path", "reference | candidate: source path for the KL claim; optional only when --probe-set names exactly one path")
             , ("probe-steps", "Frozen increasing JSON array of response steps, required when supplying probe logs")
             , ("probe-set", "JSON list of {path, steps, reference, candidate} probe attachments")
             ]
@@ -271,4 +280,4 @@ inferenceRun prefix =
             ]
 
 usage :: String
-usage = usageInfo "Usage: invar compare numerical OPTIONS\nCompare finite paired inference observations using declared calls and actual log snapshots.\nOptional reference-score-* and candidate-score-* inputs admit full-path cross-scores.\nDeclare each full-vocabulary score's own steps with its score-probe-steps option; omission declares a plain score.\nEach selected-path ratio is source minus opposite target on that source's path.\nKL requires --probe-path or --probe-set; reference-probe-* and candidate-probe-* bind full vectors at --probe-steps.\nScore attachments and KL probes are supplied independently; neither supplies the other implicitly.\nEvery selected-step KL upper bound must meet the budget; an unresolved interval is unknown.\nUse run argument arrays accept these paired-observation options without --relation or --budget.\nA successful command reports accept, refute or unknown; it does not grant use admission.\nModel substitution remains unknown." options
+usage = usageInfo "Usage: invar compare numerical OPTIONS\nCompare finite paired inference observations using declared calls and actual log snapshots.\nOptional reference-score-* and candidate-score-* inputs admit full-path cross-scores.\nDeclare each full-vocabulary score's own steps with its score-probe-steps option; omission declares a plain score.\nEach selected-path ratio is source minus opposite target on that source's path.\nKL requires --probe-path, or a --probe-set with exactly one path; reference-probe-* and candidate-probe-* bind full vectors at --probe-steps.\nScore attachments and KL probes are supplied independently; neither supplies the other implicitly.\nEvery selected-step KL upper bound must meet the budget; an unresolved interval is unknown.\nUse run argument arrays accept these paired-observation options without --relation or --budget.\nA successful command reports accept, refute or unknown; it does not grant use admission.\nModel substitution remains unknown." options
